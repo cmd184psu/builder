@@ -426,11 +426,6 @@ func (config *configStruct) ReInstallBinary() error {
 func main() {
 	args := parseArgs()
 
-	alfredo.VerbosePrintln("alternative boo")
-	alfredo.VerbosePrintln(alfredo.ExpandTilde("~boo/some/other/stuff.txt"))
-	alfredo.VerbosePrintln("in my home directory:")
-	alfredo.VerbosePrintln(alfredo.ExpandTilde("~/some/other/stuff.txt"))
-
 	var config configStruct
 
 	if alfredo.FileExistsEasy(default_config_path) {
