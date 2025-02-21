@@ -1,0 +1,51 @@
+#!/bin/sh
+
+#-ldflags "-X main.GitRevision=$(REVISION) -X main.GitBranch=$(BRANCH) -X main.GitVersion=$(VER) -X main.GitTimestamp=$(TIME)"
+
+# APPNAME := builder
+# PACKAGE := github.com/cmd184psu/builder
+# REVISION := $(shell git rev-parse --short HEAD)
+# BRANCH := $(shell git rev-parse --abbrev-ref HEAD | tr -d '\040\011\012\015\n')
+# TIME := $(shell date +%d%_b%_y-%I:%M%_\#p)
+
+R=$(git rev-parse --short HEAD)
+B=$(git rev-parse --abbrev-ref HEAD | tr -d '\040\011\012\015\n')
+GV=$(cat ./VERSION)
+TS=$(date +%d%_b%_y-%I:%M%p)
+export LF="-X main.GitRevision=\"$R\" -X main.GitBranch=\"$B\" -X main.GitVersion=\"$GV\" -X main.GitTimestamp=\"$TS\""
+
+BIN="bldr"
+
+echo "before build:"
+${BIN} -ver
+echo
+
+if ! GOOS=linux GOARCH=amd64  go build -ldflags "$LF" -o ${BIN}-linux; then
+	echo "failed to build linux version"
+fi
+
+
+
+U=$(uname)
+if [[ "$U" == "Darwin" ]]; then
+	if ! GOOS=darwin GOARCH=amd64 go build -ldflags "$LF" -o ${BIN}-mac-amd64; then
+		echo "failed to build mactel version"
+		exit 1
+	fi
+
+	if ! GOOS=darwin GOARCH=arm64 go build -ldflags "$LF" -o ${BIN}-mac-arm64; then
+		echo "failed to build apple silicon version"
+		exit 1
+	fi
+	if ! sudo lipo -create -output /usr/local/bin/${BIN} ${BIN}-mac-amd64 ${BIN}-mac-arm64; then
+		echo "failed to combine into universal binary for mac"
+		exit 1
+	fi 
+	rm ${BIN}-mac-amd64 ${BIN}-mac-arm64 
+else
+	install -m 755 ${BIN}-linux /usr/local/bin/${BIN} && rm ${BIN}-linux
+fi
+echo "after build:"
+${BIN} -ver
+echo
+

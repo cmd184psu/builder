@@ -19,3 +19,8 @@
 
 # Go workspace file
 go.work
+.netrc
+._*
+alfredo
+bldr-linux
+
