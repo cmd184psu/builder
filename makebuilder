@@ -11,8 +11,26 @@
 R=$(git rev-parse --short HEAD)
 B=$(git rev-parse --abbrev-ref HEAD | tr -d '\040\011\012\015\n')
 GV=$(cat ./VERSION)
-TS=$(date +%d%_b%_y-%I:%M%p)
-export LF="-X main.GitRevision=\"$R\" -X main.GitBranch=\"$B\" -X main.GitVersion=\"$GV\" -X main.GitTimestamp=\"$TS\""
+TS=$(date +%d%_b%_y-%I:%M%P)
+
+
+# REVISION := $(shell git rev-parse --short HEAD)
+# BRANCH := $(shell git rev-parse --abbrev-ref HEAD | tr -d '\040\011\012\015\n')
+# TIME := $(shell date +%d%_b%_y-%I:%M%_\#p)
+
+# CBTNAME=$(shell cat cbt2rpm/NAME)
+# CBTVER=$(shell cat cbt2rpm/VERSION)
+
+# LDFLAGS = \
+# 	-ldflags " -s -w\
+# 		-X 'github.com/cmd184psu/alfredo.GitRevision=$(REVISION)' \
+# 		-X 'github.com/cmd184psu/alfredo.GitBranch=$(BRANCH)' \
+# 		-X 'github.com/cmd184psu/alfredo.GitVersion=$(VER)' \
+# 		-X 'github.com/cmd184psu/alfredo.GitTimestamp=$(TIME)' \
+# 	"
+echo "TS=$TS"
+
+export LF="-X github.com/cmd184psu/alfredo.GitRevision==\"$R\" -X github.com/cmd184psu/alfredo.GitBranch=\"$B\" -X github.com/cmd184psu/alfredo.GitVersion=\"$GV\" -X github.com/cmd184psu/alfredo.GitTimestamp=\"$TS\""
 
 BIN="bldr"
 
@@ -43,7 +61,7 @@ if [[ "$U" == "Darwin" ]]; then
 	fi 
 	rm ${BIN}-mac-amd64 ${BIN}-mac-arm64 
 else
-	install -m 755 ${BIN}-linux /usr/local/bin/${BIN} && rm ${BIN}-linux
+	sudo install -m 755 ${BIN}-linux /usr/local/bin/${BIN} && rm ${BIN}-linux
 fi
 echo "after build:"
 ${BIN} -ver

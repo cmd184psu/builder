@@ -21,7 +21,12 @@ type argStruct struct {
 	//upload most recent RPM to select machines and install the rpm over ssh
 	//or copy the binary to /usr/local/bin (or /usr/bin)
 
-	Build bool // build binary or rpm
+	BuildPackage   bool // build rpm
+	BuildBinary    bool // build just a binary, using docker if provided
+	InstallPackage bool // build rpm
+	InstallBinary  bool // build rpm
+
+	Remote bool // build remotely, using remote build system, if configured
 	//build the binary or RPM
 
 	// SSHKey string
@@ -42,7 +47,8 @@ type argStruct struct {
 	SelfCheck bool
 	//check if ssh is configured correctly / remote machien is reachable
 
-	SkipBuild bool
+	SkipBuild  bool
+	BinaryOnly bool
 }
 
 func parseArgs() *argStruct {
@@ -64,9 +70,11 @@ func parseArgs() *argStruct {
 
 	flag.BoolVar(&args.Publish, "pub", false, "publish latest RPM package")
 	flag.BoolVar(&args.Publish, "publish", false, "publish latest RPM package")
-	flag.BoolVar(&args.Install, "install", false, "install latest RPM package, on each remote system")
-	flag.BoolVar(&args.Build, "build", false, "build RPM package or local binary")
-	flag.BoolVar(&args.SkipBuild, "skipbuild", false, "skip build during installation")
+	flag.BoolVar(&args.InstallPackage, "install-package", false, "install latest RPM package, on each remote system")
+	flag.BoolVar(&args.InstallBinary, "install-binary", false, "install latest RPM package, on each remote system")
+	flag.BoolVar(&args.BuildPackage, "build-package", false, "build RPM package or binary, locally, even if remote build system is configured")
+	flag.BoolVar(&args.Remote, "remote", false, "build remotely, if remote build system is configured")
+	flag.BoolVar(&args.BuildBinary, "build-binary", false, "build just the binary, using docker if required")
 
 	// flag.StringVar(&args.SSHKey,"sshkey", "", "Path to ssh key")
 	// flag.StringVar(&args.SSHIP,"sship", "", "IP of remote system")
@@ -91,7 +99,7 @@ func parseArgs() *argStruct {
 	}
 
 	if ver {
-		fmt.Printf(builder_version_fmt, BuildVersion())
+		fmt.Printf(builder_version_fmt, alfredo.BuildVersion())
 		os.Exit(0)
 	}
 
@@ -99,11 +107,22 @@ func parseArgs() *argStruct {
 }
 
 type systemStruct struct {
-	Ssh      alfredo.SSHStruct `json:"ssh"`
-	Name     string            `json:"name"`
-	Rpm      bool              `json:"rpm"`
-	RpmArch  string            `json:"rpmarch"`
-	Filename string            `json:"filename"`
+	Ssh     *alfredo.SSHStruct `json:"ssh"`
+	Name    string             `json:"name"`
+	Rpm     bool               `json:"rpm"`
+	RpmArch string             `json:"rpmarch"`
+	//	Filename            string             `json:"filename"`
+	buildLocal          bool
+	BuildDir            string     `json:"builddir,omitempty"`
+	BuildBinaryCommand  string     `json:"buildBinaryCommand,omitempty"`
+	BuildPackageCommand string     `json:"buildPackageCommand,omitempty"`
+	PackageName         string     `json:"packageName,omitempty"`
+	UpdateableFiles     []xferPair `json:"updateableFiles,omitempty"`
+	Rsync               *xferPair  `json:"rsync,omitempty"`
+	SkipRsync           bool       `json:"skipRsync,omitempty"`
+	Prefetch            string     `json:\"prefetch,omitempty\"`
+	CopyOnly            bool       `json:"copyOnly,omitempty"` // copy files, do not build
+	Skip                bool       `json:"skip,omitempty"`     // skip this system
 }
 
 type configStruct struct {
@@ -111,7 +130,32 @@ type configStruct struct {
 	InstallTargets []systemStruct `json:"installTargets"`
 	BuildCli       string         `json:"buildCLI"`   //build binary
 	PublishCli     string         `json:"publishCLI"` //build RPM?
-	PackageName    string         `json:"packageName"`
+
+}
+
+type xferPair struct {
+	Source string `json:"src"`
+	Target string `json:"tgt"`
+}
+
+// func (s *systemStruct) GetRsyncExe() *alfredo.CLIExecutor {
+// 	exe := alfredo.NewCLIExecutor()
+// 	//rsync -avz -e "ssh -i ~/.ssh/mykey" /opt/src/static root@node8x:/opt/tgt/static
+// 	//s.Ssh.key, s.BuildDir/s.Rsync.Source, s.Ssh.User@s.Ssh.host:s.Rsync.Target
+
+// 	fmt.Println(alfredo.PrettyPrint(s))
+
+// 	return exe.WithCommand(fmt.Sprintf("rsync -avz -e \"ssh -i %s\" ./%s %s@%s:%s", alfredo.ExpandTilde(s.Ssh.Key), s.Rsync.Source, s.Ssh.User, s.Ssh.Host, s.Rsync.Target)).
+// 		AsLongRunning().
+// 		WithCaptureStdout(true).
+// 		WithCaptureStderr(true)
+// }
+
+func (s *systemStruct) RsyncOverSSH() error {
+	alfredo.VerbosePrintln("BEGIN Rsync()")
+	err := s.Ssh.Rsync(s.Rsync.Source, s.Rsync.Target)
+	alfredo.VerbosePrintln("END Rsync()")
+	return err
 }
 
 func (config *configStruct) Load(filename string) error {
@@ -186,6 +230,9 @@ func (config configStruct) Show() configStruct {
 		fmt.Printf("\tSSH Key:%s\n", config.InstallTargets[i].Ssh.Key)
 		fmt.Printf("\tUser:%s\n", config.InstallTargets[i].Ssh.User)
 		fmt.Printf("\tRemote Dir:%s\n", config.InstallTargets[i].Ssh.GetRemoteDir())
+		fmt.Printf("\tPrefetch CLI:%s\n", config.InstallTargets[i].Prefetch)
+		fmt.Printf("\tCopy Only:%t\n", config.InstallTargets[i].CopyOnly)
+		fmt.Printf("\tSkip:%t\n", config.InstallTargets[i].Skip)
 	}
 
 	if runtime.GOOS == "darwin" {
@@ -252,6 +299,10 @@ func (config configStruct) SelfCheck() error {
 	fmt.Println("Install Targets:")
 	fmt.Printf("\t")
 	for i := 0; i < len(config.InstallTargets); i++ {
+		if config.InstallTargets[i].Skip {
+			fmt.Printf("Skipping %s\n", config.InstallTargets[i].Name)
+			continue
+		}
 		if err := config.InstallTargets[i].Ssh.SecureRemoteExecution("hostname -s"); err != nil {
 			return alfredo.PanicError(err.Error())
 		}
@@ -260,21 +311,21 @@ func (config configStruct) SelfCheck() error {
 	return nil
 }
 
-func BuildVersion() string {
+// func BuildVersion() string {
 
-	alfredo.VerbosePrintln("gitbranch=" + GitBranch)
-	alfredo.VerbosePrintln("ver=" + GitVersion)
-	alfredo.VerbosePrintln("time=" + GitTimestamp)
+// 	alfredo.VerbosePrintln("gitbranch=" + GitBranch)
+// 	alfredo.VerbosePrintln("ver=" + GitVersion)
+// 	alfredo.VerbosePrintln("time=" + GitTimestamp)
 
-	var gb string
-	if strings.EqualFold(GitBranch, "main") {
-		gb = ""
-	} else {
-		gb = "-" + GitBranch
-	}
+// 	var gb string
+// 	if strings.EqualFold(GitBranch, "main") {
+// 		gb = ""
+// 	} else {
+// 		gb = "-" + GitBranch
+// 	}
 
-	return fmt.Sprintf("%s%s (%s)", GitVersion, gb, GitTimestamp)
-}
+// 	return fmt.Sprintf("%s%s (%s)", GitVersion, gb, GitTimestamp)
+// }
 
 // # APPNAME := bucket-migrator
 // # PACKAGE := github.com/cloudian/bucket-migrator/version
@@ -321,53 +372,75 @@ func (config *configStruct) FixSSHKeys() {
 	}
 }
 
+func (config *configStruct) GeneratePackagePath() string {
+	ver := alfredo.GetFirstLineFromFile("VERSION")
+	rel := alfredo.GetFirstLineFromFile("RELEASE")
+	return "/opt/rpmbuild/RPMS/x86_64/" + config.BuildSystem.PackageName + "-" + ver + "-" + rel + ".x86_64.rpm"
+}
+
 func (config *configStruct) ReInstallRPM() error {
-	ver := config.BuildSystem.Ssh.RemoteGetVersion()
-	// if err := config.BuildSystem.Ssh.RemoteReadFile("VERSION"); err != nil {
-	// 	return alfredo.PanicError(err.Error())
-	// }
-	// ver := strings.Trim(config.BuildSystem.Ssh.GetBody(), "\n")
-	fmt.Printf("version=%s\n", ver)
-	// if err := config.BuildSystem.Ssh.RemoteReadFile("RELEASE"); err != nil {
-	// 	return alfredo.PanicError(err.Error())
-	// }
-	// fmt.Printf("release(?)=%q\n", config.BuildSystem.Ssh.GetBody())
-	// rel, _ := strconv.Atoi(strings.Trim(config.BuildSystem.Ssh.GetBody(), "\n"))
-	rel := config.BuildSystem.Ssh.RemoteGetRelease()
-	fmt.Printf("release=%d\n", rel)
-	suffix := fmt.Sprintf("-%s-%d.%s.rpm", ver, rel, config.BuildSystem.RpmArch)
-	fmt.Printf("suffix=%s\n", suffix)
-	prefix := alfredo.GetBaseName(config.BuildSystem.Filename)
-	prefix = prefix[:len(prefix)-len(suffix)]
+	//	ver := alfredo.GetFirstLineFromFile("VERSION")
+	//	rel := alfredo.GetFirstLineFromFile("RELEASE")
+
+	//	filename := "/opt/rpmbuild/RPMS/x86_64/" + config.BuildSystem.PackageName + "-" + ver + "-" + rel + ".x86_64.rpm"
+	filename := config.GeneratePackagePath()
+	if !alfredo.FileExistsEasy(filename) {
+		panic("RPM file not found: " + filename)
+	}
+
 	var cli []string
 	var msg []string
 	//msg = append(msg, "")
 	//		var temp string
 	for i := 0; i < len(config.InstallTargets); i++ {
+		if config.InstallTargets[i].Skip {
+			fmt.Printf("Skipping %s\n", config.InstallTargets[i].Name)
+			continue
+		}
+		//if we fail, fail fast
+		t := config.InstallTargets[i].Ssh.ConnectTimeout
+		config.InstallTargets[i].Ssh.ConnectTimeout = 2
+		if err := config.InstallTargets[i].Ssh.RemoteExecuteAndSpin("/usr/bin/true"); err != nil {
+			fmt.Printf("ERROR: simple remote execution failed with error %s; skipping this host\n", err.Error())
+			continue
+		}
+		config.InstallTargets[i].Ssh.ConnectTimeout = t
+
 		cli = nil
 		msg = nil
+		if len(config.InstallTargets[i].Ssh.RemoteDir) == 0 {
+			config.InstallTargets[i].Ssh.RemoteDir = alfredo.ExpandTilde("~/")
+		}
+		fmt.Printf("Uploading %s to %s:%s/%s\n", filename, config.InstallTargets[i].Ssh.Host, config.InstallTargets[i].Ssh.RemoteDir, alfredo.GetBaseName(filename))
+		if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].Ssh.SecureUpload, filename, config.InstallTargets[i].Ssh.RemoteDir+"/"+alfredo.GetBaseName(filename)); err != nil {
+			fmt.Printf("ERROR: file upload failed with error %s\n", err.Error())
+		}
 
-		fmt.Printf("Uploading %s to %s\n", alfredo.GetBaseName(config.BuildSystem.Filename), config.InstallTargets[i].Ssh.Host)
-		config.BuildSystem.Ssh.CrossCopy(config.BuildSystem.Filename, config.InstallTargets[i].Ssh, "~/"+alfredo.GetBaseName(config.BuildSystem.Filename))
+		if !config.InstallTargets[i].Ssh.RemoteFileExists(config.InstallTargets[i].Ssh.RemoteDir + "/" + alfredo.GetBaseName(filename)) {
+			fmt.Printf("ERROR: file not found on remote system %s:%s\n", config.InstallTargets[i].Ssh.Host, config.InstallTargets[i].Ssh.RemoteDir+"/"+alfredo.GetBaseName(filename))
+		}
+		//no need to cross copy anymore
+		//		config.BuildSystem.Ssh.CrossCopy(config.BuildSystem.Filename, *config.InstallTargets[i].Ssh, "~/"+alfredo.GetBaseName(config.BuildSystem.Filename))
 
-		msg = append(msg, fmt.Sprintf("Removing prior install on %s\n", config.InstallTargets[i].Ssh.Host))
-		cli = append(cli, fmt.Sprintf("rpm -e %s || /bin/true", prefix))
+		if !config.InstallTargets[i].CopyOnly {
+			msg = append(msg, fmt.Sprintf("Removing prior install on %s\n", config.InstallTargets[i].Ssh.Host))
+			cli = append(cli, fmt.Sprintf("sudo rpm -e %s || /bin/true", config.BuildSystem.PackageName))
 
-		msg = append(msg, fmt.Sprintf("Installing new copy on %s\n", config.InstallTargets[i].Ssh.Host))
-		cli = append(cli, fmt.Sprintf("rpm -iUvh %s%s", config.InstallTargets[i].Ssh.RemoteDir,
-			alfredo.GetBaseName(config.BuildSystem.Filename)))
+			msg = append(msg, fmt.Sprintf("Installing new copy on %s\n", config.InstallTargets[i].Ssh.Host))
+			cli = append(cli, fmt.Sprintf("sudo rpm -iUvh %s/%s", config.InstallTargets[i].Ssh.RemoteDir, alfredo.GetBaseName(filename)))
 
-		for j := 0; j < len(msg); j++ {
-			fmt.Println(msg[j])
-			alfredo.VerbosePrintf("%s %q", config.InstallTargets[i].Ssh.GetSSHCli(), cli[j])
+			for j := 0; j < len(msg); j++ {
+				fmt.Println(msg[j])
+				alfredo.VerbosePrintf("%s %q", config.InstallTargets[i].Ssh.GetSSHCli(), cli[j])
 
-			if err := config.InstallTargets[i].Ssh.RemoteExecuteAndSpin(cli[j]); err != nil {
-				fmt.Printf("exit code = %d\n", config.InstallTargets[i].Ssh.GetExitCode())
-				fmt.Println(config.InstallTargets[i].Ssh.GetStderr())
-				alfredo.VerbosePrintln("operation failed")
-				return alfredo.PanicError(err.Error())
-			} else {
-				fmt.Println(config.InstallTargets[i].Ssh.GetStdout())
+				if err := config.InstallTargets[i].Ssh.RemoteExecuteAndSpin(cli[j]); err != nil {
+					fmt.Printf("exit code = %d\n", config.InstallTargets[i].Ssh.GetExitCode())
+					fmt.Println(config.InstallTargets[i].Ssh.GetStderr())
+					alfredo.VerbosePrintln("operation failed")
+					return alfredo.PanicError(err.Error())
+				} else {
+					fmt.Println(config.InstallTargets[i].Ssh.GetStdout())
+				}
 			}
 		}
 	}
@@ -386,41 +459,112 @@ func (config *configStruct) ReInstallRPM() error {
 
 func (config *configStruct) ReInstallBinary() error {
 	alfredo.VerbosePrintln("BEGIN ReInstallBinary()")
-	var cli []string
-	var msg []string
 	for i := 0; i < len(config.InstallTargets); i++ {
-		cli = nil
-		msg = nil
-
-		fmt.Printf("Uploading %s to %s\n", alfredo.GetBaseName(config.BuildSystem.Filename), config.InstallTargets[i].Ssh.Host)
-		alfredo.VerbosePrintln(config.BuildSystem.Ssh.CrossCopyCLI(config.BuildSystem.Filename, config.InstallTargets[i].Ssh, config.InstallTargets[i].Ssh.GetRemoteDir()+"/"+alfredo.GetBaseName(config.BuildSystem.Filename)))
-		if err := config.BuildSystem.Ssh.CrossCopy(config.BuildSystem.Filename, config.InstallTargets[i].Ssh, config.InstallTargets[i].Ssh.GetRemoteDir()+"/"+alfredo.GetBaseName(config.BuildSystem.Filename)); err != nil {
-			return alfredo.PanicError(err.Error())
+		if config.InstallTargets[i].Skip {
+			fmt.Printf("Skipping %s\n", config.InstallTargets[i].Name)
+			continue
 		}
 
-		// msg = append(msg, fmt.Sprintf("Removing prior install on %s\n", config.InstallTargets[i].Ssh.Host))
-		// cli = append(cli, fmt.Sprintf("rpm -e %s || /bin/true", prefix))
+		if len(config.InstallTargets[i].Prefetch) > 0 {
+			fmt.Printf("Prefetching %s on %s\n", config.InstallTargets[i].Prefetch, config.InstallTargets[i].Ssh.Host)
+			if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].Ssh.SecureRemoteExecution, config.InstallTargets[i].Prefetch); err != nil {
+				fmt.Printf("ERROR: prefetch failed with error %s\n", err.Error())
+			}
+		}
+		if !config.InstallTargets[i].CopyOnly {
 
-		msg = append(msg, fmt.Sprintf("Version check on %s\n", config.InstallTargets[i].Ssh.Host))
-		cli = append(cli, fmt.Sprintf("%s -ver", config.InstallTargets[i].Ssh.GetRemoteDir()+"/"+config.PackageName))
+			for j := 0; j < len(config.BuildSystem.UpdateableFiles); j++ {
+				fmt.Printf("Uploading %s to %s\n", config.BuildSystem.BuildDir+"/"+config.BuildSystem.UpdateableFiles[j].Source,
+					config.InstallTargets[i].Ssh.Host+":"+config.BuildSystem.UpdateableFiles[j].Target)
 
-		for j := 0; j < len(msg); j++ {
-			fmt.Println(msg[j])
-			alfredo.VerbosePrintf("%s %q", config.InstallTargets[i].Ssh.GetSSHCli(), cli[j])
+				if len(config.BuildSystem.UpdateableFiles[j].Source) == 0 {
+					fmt.Println(alfredo.PrettyPrint(config.BuildSystem.UpdateableFiles))
+					panic("missing source file")
+				}
 
-			if err := config.InstallTargets[i].Ssh.RemoteExecuteAndSpin(cli[j]); err != nil {
-				fmt.Printf("exit code = %d\n", config.InstallTargets[i].Ssh.GetExitCode())
-				fmt.Println(config.InstallTargets[i].Ssh.GetStderr())
-				alfredo.VerbosePrintln("operation failed")
-				return alfredo.PanicError(err.Error())
-			} else {
-				fmt.Println(config.InstallTargets[i].Ssh.GetStdout())
+				//upload config.BuildSystem.BuildDir+"/"+config.BuildSystem.UpdateableFiles[j].Source to config.BuildSystem.UpdateableFiles[j].Target
+				if config.InstallTargets[i].Ssh.User != "root" {
+
+					if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].Ssh.SecureUpload, config.BuildSystem.BuildDir+"/"+config.BuildSystem.UpdateableFiles[j].Source, "/tmp/"+filepath.Base(config.BuildSystem.UpdateableFiles[j].Target)); err != nil {
+						fmt.Printf("ERROR uploading file: %s\n", err.Error())
+					}
+
+					if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].Ssh.SecureRemoteExecution, fmt.Sprintf("sudo install -m 755 %s %s", "/tmp/"+filepath.Base(config.BuildSystem.UpdateableFiles[j].Target), config.BuildSystem.UpdateableFiles[j].Target)); err != nil {
+						fmt.Printf("ERROR installing file: %s\n", err.Error())
+					}
+
+				} else {
+					if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].Ssh.SecureUpload, config.BuildSystem.BuildDir+"/"+config.BuildSystem.UpdateableFiles[j].Source, config.BuildSystem.UpdateableFiles[j].Target); err != nil {
+						fmt.Printf("ERROR uploading file: %s\n", err.Error())
+					}
+				}
+			}
+
+			if config.InstallTargets[i].Rsync != nil && !config.InstallTargets[i].SkipRsync {
+				fmt.Printf("Rsyncing %s to %s\n", config.BuildSystem.BuildDir+"/"+config.InstallTargets[i].Rsync.Source,
+					config.InstallTargets[i].Ssh.Host+":"+config.InstallTargets[i].Rsync.Target)
+				if err := alfredo.GoFuncAndSpin(config.InstallTargets[i].RsyncOverSSH); err != nil {
+					fmt.Println(config.InstallTargets[i].Ssh.GetBody())
+					fmt.Printf("ERROR: rsync failed with error %s\n", err.Error())
+				}
 			}
 		}
 	}
 
 	alfredo.VerbosePrintln("END ReInstallBinary()")
 	return nil
+}
+
+func (s *systemStruct) OnlyBuildPackage(b bool) *systemStruct {
+	s.Rpm = b
+	return s
+}
+func (s *systemStruct) OnlyBuildBinary(b bool) *systemStruct {
+	s.Rpm = false
+	return s
+}
+func (s *systemStruct) OnlyBuildLocal(b bool) *systemStruct {
+	s.buildLocal = b
+	return s
+}
+
+func (s *systemStruct) ShouldBuildLocal() bool {
+	return s.buildLocal || s.Ssh == nil
+}
+
+func (s *systemStruct) ShouldBuildBinary() bool {
+	return !s.Rpm
+}
+func (s *systemStruct) ShouldBuildPackage() bool {
+	return s.Rpm
+}
+
+func (s *systemStruct) GenerateBuildExec(packageName string) *alfredo.CLIExecutor {
+	exe := alfredo.NewCLIExecutor()
+	exe.AsLongRunning().
+		WithSpinny(true)
+
+	if len(s.BuildDir) > 0 {
+		exe.WithDirectory(s.BuildDir)
+	}
+
+	if !s.ShouldBuildLocal() {
+		exe.WithSSHStruct(*s.Ssh)
+	}
+	exe.WithCaptureStderr(true).
+		WithCaptureStdout(true)
+	if s.ShouldBuildPackage() && len(s.BuildPackageCommand) > 0 {
+		p := s.BuildPackageCommand
+		if strings.Contains(p, "%s") {
+			p = fmt.Sprintf(p, packageName)
+		}
+		exe.WithCommand(p)
+	} else if s.ShouldBuildBinary() && len(s.BuildBinaryCommand) > 0 {
+		exe.WithCommand(s.BuildBinaryCommand)
+	} else {
+		panic("unknown build type")
+	}
+	return exe
 }
 
 func main() {
@@ -444,53 +588,83 @@ func main() {
 			panic(err.Error())
 		}
 	}
-	if args.Build || (args.Install && !args.SkipBuild) {
-		if !config.BuildSystem.Rpm {
-			config.BuildCli = config.BuildSystem.Ssh.GenerateRemoteGoBuildCLI(config.PackageName)
+	if args.BuildPackage || args.BuildBinary {
+		if args.BuildPackage {
+			config.BuildSystem.OnlyBuildPackage(true)
 		}
-		if len(config.BuildCli) == 0 {
+		if args.BuildBinary {
+			config.BuildSystem.OnlyBuildBinary(true)
+		}
+		config.BuildSystem.OnlyBuildLocal(!(config.BuildSystem.Ssh != nil && args.Remote))
+
+		exe := config.BuildSystem.GenerateBuildExec(config.BuildSystem.PackageName)
+
+		// if !config.BuildSystem.Rpm {
+		// 	config.BuildCli = config.BuildSystem.Ssh.GenerateRemoteGoBuildCLI(config.PackageName)
+		// }
+		if len(exe.GetCli()) == 0 {
 			fmt.Println("missing build cli")
 			os.Exit(1)
 		}
-		alfredo.VerbosePrintf("%s %q", config.BuildSystem.Ssh.GetSSHCli(), fmt.Sprintf("cd %s; %s", config.BuildSystem.Ssh.GetRemoteDir(), config.BuildCli))
-		fmt.Printf("Building...%s...", config.PackageName)
 
-		if err := config.BuildSystem.Ssh.RemoteExecuteAndSpin(config.BuildCli); err != nil {
-			fmt.Println(config.BuildSystem.Ssh.GetStderr())
+		if args.BuildPackage {
+			fmt.Printf("Building...%s...", config.BuildSystem.PackageName)
+		} else {
+			fmt.Printf("Building binary...")
+		}
+		fmt.Println("CLI=" + exe.GetCli())
+		//stop it here and review
+		//		os.Exit(1)
+
+		err := exe.Execute()
+
+		fmt.Println(exe.GetResponseBody())
+
+		if err != nil {
 			panic(err.Error())
 		}
 
-		if config.BuildSystem.Rpm {
-			temp := alfredo.GetFirstLineFromSlice(config.BuildSystem.Ssh.GetBody(), "Wrote")
-			config.BuildSystem.Filename = strings.Replace(temp[7:], "/root", "/opt", 1)
-			fmt.Printf("Wrote: %s\n", config.BuildSystem.Filename)
-		} else {
-			config.BuildSystem.Filename = config.BuildSystem.Ssh.GetRemoteDir() + "/" + config.PackageName
-		}
+		// if args.BuildPackage {
+		// 	fmt.Println("===============")
+		// 	fmt.Println(exe.GetResponseBody())
+		// 	fmt.Println("===============")
 
-		if alfredo.GetVerbose() {
-			alfredo.VerbosePrintln(config.BuildSystem.Ssh.GetBody())
-		}
+		//temp := alfredo.GetFirstLineFromSlice(exe.GetResponseBody(), "Wrote")
+		//ver := alfredo.GetFirstLineFromFile("VERSION")
+		//rel := alfredo.GetFirstLineFromFile("RELEASE")
+
+		//config.BuildSystem.Filename = "/opt/rpmbuild/RPMS/x86_64/" + config.BuildSystem.PackageName + "-" + ver + "-" + rel + ".x86_64.rpm"
+
+		// if len(temp) < 7 {
+		// 	fmt.Println("unable to parse build output")
+		// } else {
+		// 	config.BuildSystem.Filename = strings.Replace(temp[7:], "/root", "/opt", 1)
+		// 	fmt.Printf("Wrote: %s\n", config.BuildSystem.Filename)
+		// }
+		//		}
+		// } else {
+
+		// 	config.BuildSystem.Filename = config.BuildSystem.BuildDir+"/"+config.BuildSystem.UpdateableFiles[i].Source
+		// }
+
 		fmt.Println("build complete")
 
 	}
 
-	if args.Install {
+	if args.InstallBinary {
 		fmt.Printf("About to install on %d target systems\n", len(config.InstallTargets))
 		//"filename": "%s/%s-%s-%d.%s.rpm"
-
-		if config.BuildSystem.Rpm {
-			if err := config.ReInstallRPM(); err != nil {
-				panic(err.Error())
-			}
-		} else {
-			if err := config.ReInstallBinary(); err != nil {
-				panic(err.Error())
-			}
+		if err := config.ReInstallBinary(); err != nil {
+			panic(err.Error())
 		}
-
 		fmt.Println("Installation Complete")
+	}
 
+	if args.InstallPackage {
+		if err := config.ReInstallRPM(); err != nil {
+			panic(err.Error())
+		}
+		fmt.Println("Installation Complete")
 	}
 	// 	var buildErr error
 	// 	if runtime.GOOS == "darwin" {
@@ -535,6 +709,21 @@ func main() {
 	if args.Show {
 		config.Show()
 	}
-	config.Save(default_config_path)
+	if args.Publish {
+		if len(config.PublishCli) == 0 {
+			panic("Publish CLI not set in config")
+		}
+		fmt.Println("Publishing latest RPM package")
+		exe := alfredo.NewCLIExecutor().
+			WithCommand(fmt.Sprintf(config.PublishCli, config.GeneratePackagePath())).
+			AsLongRunning().DumpOutput()
+		//			WithCaptureStdout(true).
+		//			WithCaptureStderr(true)
+		if err := exe.Execute(); err != nil {
+			panic(err.Error())
+		}
+		//		fmt.Println(exe.GetResponseBody())
+	}
+	//config.Save(default_config_path)
 	alfredo.VerbosePrintln("complete")
 }
